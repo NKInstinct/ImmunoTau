@@ -1,0 +1,231 @@
+---
+title: "Tau-related immune infiltration analysis"
+author: "Andrew Wight"
+format: revealjs
+editor: visual
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(ggpubr)
+library(Seurat)
+
+theme_set(theme_pubr())
+
+```
+
+```{r}
+#| label: functions from paper
+
+add_metadata <- function(data) {
+  mito.genes <-
+    grep(pattern = "^Mt\\.|^MT\\.|^mt\\.|^Mt-|^MT-|^mt-",
+         x = rownames(x = GetAssayData(object = data)),
+         value = TRUE)
+  percent.mito <-
+    Matrix::colSums(GetAssayData(object = data, slot = "counts")[mito.genes, ]) /
+    Matrix::colSums(GetAssayData(object = data, slot = "counts"))
+  data[['percent.mito']] <- percent.mito
+  data[['percent.mito_log10']] <- log10(data[['percent.mito']] + 1)
+  data[['nCount_RNA_log10']] <- log10(data[['nCount_RNA']] + 1)
+  data[['nFeature_RNA_log10']] <- log10(data[['nFeature_RNA']] + 1)
+  data[['nCount_RNA_log2']] <- log2(data[['nCount_RNA']] + 1)
+  data[['nFeature_RNA_log2']] <- log2(data[['nFeature_RNA']] + 1)
+  data[['scaled_mito']] <- scale(percent.mito)
+  data[['scaled_nCount_RNA']] <- scale(data[['nCount_RNA_log10']])
+  attr(data$scaled_nCount_RNA, "scaled:center") <- NULL
+  attr(data$scaled_nCount_RNA, "scaled:scale") <- NULL
+  attr(data$scaled_mito, "scaled:center") <- NULL
+  attr(data$scaled_mito, "scaled:scale") <- NULL
+  data
+}
+
+get_conf_interval <- function(dataset, parameter) {
+  left <- mean(dataset[[parameter]][[1]]) - qnorm(0.975)
+  right <- mean(dataset[[parameter]][[1]]) + qnorm(0.975)
+  return(c(left, right))
+}
+
+filter_mito <- function(dataset, path){
+  expr <- FetchData(object = dataset, vars = 'scaled_mito')
+  dataset <- dataset[, which(x = expr < get_conf_interval(dataset, 'scaled_mito')[2])]
+  dataset
+}
+
+```
+
+```{r}
+#| label: data read
+#| eval: false
+
+seuratList <- pmap(list(path = c("data/E4-1/", "data/E4-2/", 
+                             "data/TE4-1/", "data/TE4-2/"),
+                    sample = c("E4-1", "E4-2", "TE4-1", "TE4-2"),
+                    genotype = c("E4", "E4", "TE4", "TE4"),
+                    cell_type = c("CD45", "CD45", "CD45", "CD45"),
+                    part = c("Par", "Par", "Par", "Par")),
+              \(path, sample, genotype, cell_type, part) CreateSeuratObject(Read10X(path), min.cells = 3, project = "at_redo") |>
+                  add_metadata() |>
+                  AddMetaData(genotype, col.name = "genotype") |>
+                  AddMetaData(cell_type, col.name = "cell_type") |>
+                  AddMetaData(part, col.name = "part")) |>
+    map2(c("data/E4-1/", "data/E4-2/", "data/TE4-1/", "data/TE4-2/"),
+         \(x, path) filter_mito(x, path)) |>
+    map(\(x) SCTransform(x, ncells = min(100000, ncol(x)), vars.to.regress = "percent.mito", verbose = TRUE, conserve.memory = TRUE))
+
+features <- SelectIntegrationFeatures(seuratList)
+seuratList <- map(seuratList, RunPCA, features = features)
+
+seuratList <- PrepSCTIntegration(seuratList, anchor.features = features)
+anchors <- FindIntegrationAnchors(seuratList, normalization.method = "SCT", anchor.features = features, reduction = "rpca")
+
+seurat <- IntegrateData(anchors, normalization.method = "SCT") |>
+    RunPCA() |>
+    RunUMAP(dims = 1:20) |>
+    FindNeighbors(dims = 1:20) |>
+    FindClusters(resolution = c(0.2, 0.4, 0.6, 0.8, 1))
+
+write_rds(seurat, "data/integrated_seurat.Rds")
+```
+
+```{r, fig.height = 8, fig.width = 8}
+
+#| eval: false
+
+
+seurat <- read_rds("data/integrated_seurat.Rds")
+
+DimPlot(seurat, label = TRUE)
+
+# T cells & NK cells
+
+FeaturePlot(seurat, features = c("Cd3e", "Cd8a", "Cd4", "Klrb1c"), label = TRUE) * 
+    scale_colour_viridis_c(option = "B")
+
+# Microglia
+
+FeaturePlot(seurat, features = c("Irf7", "Itgax", "Tmem119", "P2ry12"), label = TRUE) *
+    scale_colour_viridis_c(option = "B")
+
+# Others
+
+FeaturePlot(seurat, features = c("Fn1", "S100a8", "Cd19")) *
+    scale_colour_viridis_c(option = "B")
+
+rename <- tibble(oldName = c(0:26)) |>
+    mutate(newName = case_when(oldName %in% c(14, 15, 26) ~ "CD8 T cells",
+                               oldName == 17 ~ "CD4 T cells",
+                               oldName == 25 ~ "NK cells",
+                               oldName == 16 ~ "IRM",
+                               oldName == 9 ~ "DAM",
+                               oldName == 18 ~ "Macrophage",
+                               oldName == 23 ~ "B cells",
+                               oldName == 20 ~ "Neutrophils",
+                               oldName %in% c(3, 21, 12, 1, 7, 13, 2, 6, 22, 10, 8, 4, 5) ~ "Microglia",
+                               TRUE ~ "Other"))
+
+newIds <- rename$newName |>
+    setNames(rename$oldName)
+seurat <- RenameIdents(seurat, newIds)
+
+DimPlot(seurat, split.by = "genotype", label = TRUE) + NoLegend()
+
+write_rds(seurat, "data/integrated_seurat.Rds")
+```
+
+```{r}
+seurat <- read_rds("data/integrated_seurat.Rds")
+
+DimPlot(seurat, split.by = "genotype", label = TRUE) + NoLegend()
+
+DERes <- map(levels(Idents(seurat)),
+             \(clust) FindMarkers(seurat, ident.1 = "E4", group.by = "genotype", subset.ident = clust)) |>
+    setNames(levels(Idents(seurat)))
+
+write_rds(DERes, "data/DEG results by cluster.Rds")
+```
+
+```{r}
+library(pathfindR)
+
+DERes <- read_rds("data/DEG results by cluster.Rds")
+
+PathfindRes <- map(DERes, \(df) as_tibble(df, rownames = "Gene Symbol") |>
+                       dplyr::select(`Gene Symbol`, 
+                                     `Change value` = "avg_log2FC", 
+                                     `p value` = "p_val_adj") |>
+                       as.data.frame() |>
+                       run_pathfindR(visualize_enriched_terms = FALSE,
+                                     plot_enrichment_chart = FALSE))
+
+write_rds(PathfindRes, "data/PathfindRes.Rds")
+
+PathfindRes$`CD8 T cells`
+
+library(seqHelpers)
+
+bubbles <- map(PathfindRes, dge_CleanPathfinder)[c(2, 4, 6)] |>
+    map(\(x) bubblePlot(x) +
+            coord_flip(ylim = c(0, 16)))
+
+write_rds(bubbles, "BubblePlots.Rds")
+
+kegg <- map(DERes, \(df) as_tibble(df, rownames = "Newid") |>
+        dplyr::rename(PValue = "p_val_adj", logFC = "avg_log2FC") |>
+        dge_PrepKeggData())
+write_rds(kegg, "KeggData.Rds")
+
+# COVID-19
+plotKEGG(kegg$Microglia, "05171")
+file.rename("mmu05171..png", "Microglia - Covid.png")
+plotKEGG(kegg$`CD8 T cells`, "05171")
+file.rename("mmu05171..png", "CD8 - Covid.png")
+plotKEGG(kegg$`CD4 T cells`, "05171")
+file.rename("mmu05171..png", "CD4 - Covid.png")
+
+# MAPK
+plotKEGG(kegg$Microglia, "04010")
+file.rename("mmu04010..png", "Microglia - MAPK.png")
+plotKEGG(kegg$`CD8 T cells`, "04010")
+file.rename("mmu04010..png", "CD8 - MAPK.png")
+
+# Lipid & Atherosclerosis
+plotKEGG(kegg$Microglia, "05417")
+file.rename("mmu05417..png", "Microglia - atherosclerosis.png")
+
+# Ribosome
+plotKEGG(kegg$`CD8 T cells`, "03010")
+file.rename("mmu03010..png", "CD8 - ribosome.png")
+plotKEGG(kegg$`CD4 T cells`, "03010")
+file.rename("mmu03010..png", "CD4 - ribosome.png")
+
+# Cytokine-cytokine
+plotKEGG(kegg$`CD8 T cells`, "04060")
+file.rename("mmu04060..png", "CD8 - Cytokine.png")
+
+# TCR signaling
+plotKEGG(kegg$`CD4 T cells`, "04660")
+file.rename("mmu04660..png", "CD4 - TCR.png")
+plotKEGG(kegg$`CD8 T cells`, "04660")
+file.rename("mmu04660..png", "CD8 - TCR.png")
+
+# Cell Cycle
+plotKEGG(kegg$DAM, "04110")
+file.rename("mmu04110..png", "DAM - Cell Cycle.png")
+
+# NK cytotox
+plotKEGG(kegg$`NK cells`, "04650")
+file.rename("mmu04650..png", "NK - Cytotoxicity.png")
+plotKEGG(kegg$`CD8 T cells`, "04650")
+file.rename("mmu04650..png", "CD8 - Cytotoxicity.png")
+
+# Get Seurat maps
+DimPlot(seurat, label = TRUE) + NoLegend()
+ggsave("combined_umap.png", width = 7, height = 7)
+
+DimPlot(seurat, split.by = "genotype") + NoLegend()
+ggsave("split_umap.png", width = 7, height = 4)
+```
